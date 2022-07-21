@@ -22,6 +22,7 @@ params = {
 ```
 
 ## Patches in this branch:
+* __(/mesh_transformer/layers.py)__ Three dropout layers have been added -- one right after word embedding and positional encoding (unless we're using rotary positional embeddings or T5 relative positional embeddings, in which case it's done right after word embedding), one in-between the softmax and the value matrix multiplication in the self attention, and one right after the output matrix multiplication in the self attention. The dropout rates for these are controlled by the config options `"embedding_dropout"`, `"attention_dropout"` and `"residual_dropout"`, which all currently default to 0.0. They may be set to floating point numbers inclusively between 0 and 1. If any are set higher than 0.0, you have to pass an RNG key to whichever haiku-transformed apply function computes training loss in your training script because we need to use `hk.next_rng_key()` for dropout to work properly.
 * __(/mesh_transformer/layers.py)__ Added support for more types of positional embedding:
     * `"pe": "sinusoidal"`: The original sinusoidal positional embedding described in the original paper on transformer models, "Attention Is All You Need" (https://arxiv.org/pdf/1706.03762.pdf), in section 3.5 Positional Encoding.
     * `"pe": "fairseq_sinusoidal"`: A variant of sinusoidal positional embedding currently used by fairseq. Most fairseq causal language models use this type of positional embedding.
