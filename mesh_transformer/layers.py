@@ -339,6 +339,8 @@ class EmbeddingShard(hk.Module):
 
         self.d_embed = config.get("d_embed", self.out_dim)
 
+        self.embedding_dropout = config.get("embedding_dropout", 0.0)
+
         if config["pe"] == "fixed":
             embed_init = hk.initializers.TruncatedNormal(stddev=0.02)
             self.positional_embeddings = hk.get_parameter('pos_embs', [config["seq"], self.out_dim_per_shard], init=embed_init)
@@ -402,6 +404,9 @@ class EmbeddingShard(hk.Module):
             pos_embed = jnp.roll(pos_embed, -pe_length, axis=0)[-proj_out.shape[0]:]
             proj_out += pos_embed
 
+        if 0.0 < self.embedding_dropout <= 1.0:
+            proj_out = hk.dropout(hk.next_rng_key(), self.embedding_dropout, proj_out)
+
         if self.compat == "bloom":
             proj_out = f_psum(proj_out)
             proj_out = self.norm(proj_out)
@@ -451,6 +456,9 @@ class TransformerLayerShard(hk.Module):
         self.use_combined_qkv = config.get("combined_qkv", self.compat in ("neox", "bloom"))
         self.early_all_reduce = self.compat == "neox" and not self.neox_gpt_j_residual
         self.do_layer_norm_before = config.get("do_layer_norm_before", True)
+
+        self.attention_dropout = config.get("attention_dropout", 0.0)
+        self.residual_dropout = config.get("residual_dropout", 0.0)
 
         assert dim % heads == 0
         assert heads % shards == 0
@@ -512,9 +520,14 @@ class TransformerLayerShard(hk.Module):
         attention_logits += attn_bias
 
         attention_weights = jax.nn.softmax(attention_logits)
+        if 0.0 < self.attention_dropout <= 1.0:
+            attention_weights = hk.dropout(hk.next_rng_key(), self.attention_dropout, attention_weights)
         attention_vec = jnp.einsum("htT,Thd->thd", attention_weights, v).reshape((-1, self.dim_per_shard))
 
-        return self.o(attention_vec)
+        attention_out = self.o(attention_vec)
+        if 0.0 < self.residual_dropout <= 1.0:
+            attention_out = hk.dropout(hk.next_rng_key(), self.residual_dropout, attention_out)
+        return attention_out
 
     def ff(self, x):
         dense_proj = self.dense_proj(x)
