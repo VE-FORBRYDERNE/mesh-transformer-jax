@@ -8,6 +8,13 @@ except ImportError:
     HAS_OPTAX = False
 
 
+def process_index():
+    return jax.process_index() if hasattr(jax, "process_index") else jax.host_id()
+
+def process_count():
+    return jax.process_count() if hasattr(jax, "process_count") else jax.host_count()
+
+
 # same as with_sharding_constraint but doesn't fail if run outside of pjit/mesh context
 def maybe_shard(x, resource):
     try:

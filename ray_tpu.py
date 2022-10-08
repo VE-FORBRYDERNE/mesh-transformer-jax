@@ -5,7 +5,10 @@ import time
 
 import glob
 import requests
+
 from fabric import Connection
+
+from inspect import signature
 
 
 @functools.lru_cache()
@@ -99,8 +102,8 @@ def wait_til(name, zone, state):
     while True:
         ret = check_tpu(name, zone)
 
-        print("wait_til check")
-        print(ret)
+        # print("wait_til check")
+        # print(ret)
 
         matches = True
         for k, expected_v in state.items():
@@ -123,19 +126,61 @@ def wait_til(name, zone, state):
 
 
 def get_connection(
-        name,
-        zone,
+    name,
+    zone,
 ):
     info = check_tpu(name, zone)
     outputs = []
+    key_filename = os.path.expanduser('~/.ssh/google_compute_engine')
+
+    print('—— get_connection', name, zone, key_filename)
     for i in info["networkEndpoints"]:
-        outputs.append(Connection(i["ipAddress"],
-                                  connect_kwargs={
-                                      "key_filename": os.path.expanduser('~/.ssh/google_compute_engine'), }))
+        print('networkEndpoint', name, i, i["ipAddress"])
+        outputs.append(Connection(
+            i["ipAddress"],
+            connect_kwargs={ "key_filename": key_filename }
+        ))
+
     return outputs
 
-
 def start_ray(conn, address, version=1):
+    print('— IGNORE START_RAY')
+
+    return
+
+    print('— STOP OLD RAY')
+    try:
+        conn.run('ray stop -f', hide=False)
+    except:
+        pass
+
+    time.sleep(3)
+    print('—— start_ray version', version, address)
+
+    conn.put("scripts/no_init.sh", "/tmp/ray-tpu.sh")
+    conn.sudo('chmod +x /tmp/ray-tpu.sh', hide=False)
+    conn.sudo('/tmp/ray-tpu.sh', hide=False)
+
+    print('— copied files')
+
+    time.sleep(3)
+
+    print('——— CONNECTING', address)
+
+    out = conn.run(f"bash /tmp/ray-tpu.sh {address}", hide=False)
+
+    # --include-dashboard False
+    # conn.run(f"TCMALLOC_LARGE_ALLOC_REPORT_THRESHOLD={32 * 1024**3} ray start --address={address} --resources='" + '{"TPU": 1}\'', hide=False)
+
+    # --load-code-from-local
+
+    # conn.run(f"ray start --address={address} --include-dashboard False --resources='" + '{"TPU": 1}\'')
+
+    # print('— finished start_ray', result)
+    # return result
+
+
+def start_ray_backup(conn, address, version=1):
     conn.sudo('rm -rf *.py')
     conn.sudo('rm -rf mesh_transformer')
 
@@ -147,19 +192,28 @@ def start_ray(conn, address, version=1):
     for i in glob.glob("mesh_transformer/*.py"):
         conn.put(i, "mesh_transformer/")
 
-    conn.sudo('python3 setup.py install', hide=True)
+    conn.sudo('python3 setup.py install', hide=False)
 
     if version == 2:
         conn.put("scripts/init_ray_v2.sh", "/tmp/ray-tpu.sh")
     else:
         conn.put("scripts/init_ray.sh", "/tmp/ray-tpu.sh")
-    conn.sudo('chmod +x /tmp/ray-tpu.sh', hide=True)
-    conn.sudo('/tmp/ray-tpu.sh', hide=True)
+
+    conn.sudo('chmod +x /tmp/ray-tpu.sh', hide=False)
+    conn.sudo('/tmp/ray-tpu.sh', hide=False)
+
     try:
-        conn.run('ray stop -f', hide=True)
+        conn.run('ray stop -f', hide=False)
     except:
         pass
 
     time.sleep(1)
 
-    conn.run(f"TCMALLOC_LARGE_ALLOC_REPORT_THRESHOLD={32 * 1024**3} ray start --address={address} --resources='" + '{"tpu": 1}\' --include-dashboard False', hide=True)
+    print('——— BACKUP CONECT!!!')
+
+    # --load-code-from-local
+
+    print(
+        conn.run(f"ray start --address={address} --include-dashboard=false --resources='" + '{"TPU": 1}\'')
+    )
+    # conn.run(f"TCMALLOC_LARGE_ALLOC_REPORT_THRESHOLD={32 * 1024**3} ray start --address={address} --resources='" + '{"t p u": 1}\' --include-dashboard False', hide=True)

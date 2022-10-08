@@ -9,10 +9,12 @@ class TFRecordLoader:
     def __init__(self, index_fname, batch_size, parse_fn, map_fn=None, restore_state=None):
         if restore_state is not None:
             self.file_idx = restore_state["file_idx"]
+            self.restored_idx = restore_state["file_idx"]
             self.file_idx_init = False
             self.used = restore_state["used"]
         else:
             self.file_idx = 0
+            self.restored_idx = 0
             self.file_idx_init = True
             self.used = []
 
@@ -33,6 +35,7 @@ class TFRecordLoader:
         self.file_idx = 0
         self.file_idx_init = True
         self.used = []
+        self.restored_idx = 0
 
         self.clean_index = list(filter(lambda x: x not in self.used, self.index))
         self.sample_fn = self.sample_once()
@@ -51,7 +54,7 @@ class TFRecordLoader:
 
                 if not self.file_idx_init and file_idx <= self.file_idx:
                     if file_idx % 1000 == 0:
-                        print(f"skipping to batch {self.file_idx}, currently at {file_idx}")
+                        print(f"> skipping to batch {self.file_idx}, currently at {file_idx}")
                     continue
                 self.file_idx_init = True
                 self.file_idx = file_idx

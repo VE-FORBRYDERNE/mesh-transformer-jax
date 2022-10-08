@@ -7,15 +7,26 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import multiprocessing
+from jax.experimental.maps import thread_resources
 
 try:
     from smart_open import open
 except ImportError:
     pass
 
-from mesh_transformer.util import head_print, to_bf16
+from mesh_transformer.util import head_print, to_bf16, process_index
+
+import functools
 
 pieces = 16  # how many files to split each shard across
+
+if not getattr(print, "_train_actor_patched", False):
+    old_print = print
+    @functools.wraps(print)
+    def new_print(*args, **kwargs):
+        old_print(f"[NODE {process_index()}]", *args, **kwargs)
+    new_print._train_actor_patched = True
+    print = new_print
 
 
 def fix_dtype(pytree):
@@ -56,7 +67,11 @@ def split(a, n):
     return (a[i * k + min(i, m):(i + 1) * k + min(i + 1, m)] for i in range(n))
 
 
-def write_ckpt(pytree, dir, shard):
+def write_ckpt(pytree, dir, shard, node_index=0, save_opt_state=True, total_shards=99999999):
+    original_opt_state = pytree["opt_state"]
+    if not save_opt_state:
+        del pytree["opt_state"]
+
     # ckpt_dir = Path(dir)
     # ckpt_dir.mkdir(parents=True, exist_ok=True)
 
@@ -74,11 +89,14 @@ def write_ckpt(pytree, dir, shard):
     # print(f"changed weight types in {time.time() - start:.06}s")
 
     with multiprocessing.pool.ThreadPool(pieces) as p:
-        write_fn = functools.partial(write, ckpt_dir=f"{dir}shard_{shard}/")
+        write_fn = functools.partial(write, ckpt_dir=f"{dir}shard_{shard + (node_index * jax.local_device_count())%total_shards}/")
 
         start = time.time()
         list((p.imap_unordered(write_fn, enumerate(cpu_flattened_chunked))))
         # print(f"written to gcs in {time.time() - start:.06}s")
+    
+    if not save_opt_state:
+        pytree["opt_state"] = original_opt_state
 
 
 def read_shard(ckpt_dir):
@@ -133,12 +151,95 @@ def reshard(x, old_shape):
     return out
 
 
-def read_ckpt(pytree, dir, shards_in, shards_out=None, load_opt=True):
-    move_xmap = jax.experimental.maps.xmap(fun=lambda x, _: to_bf16(x),
-                                       in_axes=(["shard", ...], ["batch", ...]),
-                                       out_axes=["shard", ...],
-                                       axis_resources={'shard': 'mp', 'batch': 'dp'})
+def reshard_reverse(x, old_shape):
+    if len(x.shape) == 1:
+        out = np.tile(x[0:1], (old_shape[0],))
 
+    elif len(x.shape) == 2:
+        #print(f"LN/bias")
+        if old_shape[1] == x.shape[1]:
+            #print("LN")
+            if (x[1:] == 0).all() or (x[1:] == 1).all():
+                out = np.tile(x[0:1], (old_shape[0], 1))
+            else:
+                #print("shard bias")
+                out = np.tile(x[0:1], (old_shape[0], 1)) * (x.shape[0] / old_shape[0])
+        else:
+            #print("bias")
+            out = x.reshape(old_shape)
+
+    elif len(x.shape) == 3:
+        if x.shape[0] * x.shape[2] == old_shape[2]:
+            #print("case 1")
+            out = x.reshape(old_shape)
+        elif x.shape[0] * x.shape[1] == old_shape[1]:
+            #print("case 2")
+            out = jnp.transpose(x.reshape((old_shape[1], old_shape[0], old_shape[2])), (1, 0, 2))
+        else:
+            raise Exception(f"unimplemented, {x.shape}, {old_shape}")
+    else:
+        raise Exception(f"unimplemented, {x}")
+    #flattened, structure = jax.tree_flatten(out)
+    #return flattened
+    return out
+
+
+def read_ckpt(pytree, dir, shards_in, shards_out=None, load_opt=True, shard_offset=0):
+    print(f"Shards in: {shards_in};  shards out: {shards_out}")
+    if shards_out is None:
+        shards_out = shards_in
+
+    old_flattened, structure = jax.tree_flatten(pytree)
+
+    original_opt_state = pytree["opt_state"]
+
+    # TODO: figure out how to use a process pool here for more speed
+    with multiprocessing.pool.ThreadPool(shards_in) as p:
+        start = time.time()
+        shard_paths = [f"{dir}shard_{(shard_offset + i) % thread_resources.env.shape['mp']}/" for i in range(shards_in)]
+        print("shard_paths:", shard_paths)
+        shards = list((p.imap(read_shard, shard_paths)))
+        print(f"read from disk/gcs in {time.time() - start:.06}s")
+
+    def _unshard(shards, old_flattened):
+        unsharded = []
+
+        for i, (old, *all_shards) in enumerate(zip(old_flattened, *shards)):
+            x = np.stack(all_shards)
+            # No idea why this is V2...?
+            if x.dtype == np.dtype('V2'):
+                x.dtype = jnp.bfloat16
+
+            if shards_out == shards_in:
+                pass
+            elif shards_out != shards_in and shards_out == 1:
+                x = reshard(x, old.shape)
+            elif shards_out > shards_in:
+                x = reshard_reverse(x, old.shape)
+            else:
+                raise NotImplementedError(f"Unsupported shards_in and shards_out: {shards_in} and {shards_out}")
+            unsharded.append(x)
+
+            assert x.shape == old.shape, f"Incompatible checkpoints {x.shape} vs {old.shape}"
+        return unsharded
+    try:
+        unsharded = _unshard(shards, old_flattened)
+    except AssertionError:
+        load_opt = False  # no opt to load in ckpt
+        del pytree['opt_state']
+        old_flattened, structure = jax.tree_flatten(pytree)
+        unsharded = _unshard(shards, old_flattened)
+
+    print("Finished reshaping tensors")
+
+    loaded_pytree = jax.tree_unflatten(structure, unsharded)
+
+    if not load_opt:
+        loaded_pytree['opt_state'] = original_opt_state
+    return loaded_pytree
+
+
+def read_ckpt_lowmem(pytree, dir, shards_in, shards_out=None, load_opt=True):
     if shards_out is None:
         shards_out = shards_in
 
@@ -164,10 +265,16 @@ def read_ckpt(pytree, dir, shards_in, shards_out=None, load_opt=True):
                         array.dtype = jnp.bfloat16
                     unstacked.append(array)
 
-                x = move_xmap(jnp.stack(unstacked), np.empty(shards_in))
+                x = jax.device_put(jnp.stack(unstacked), device=devices[device_index % device_count])
 
-                if shards_out != shards_in:
+                if shards_out == shards_in:
+                    pass
+                elif shards_out != shards_in and shards_out == 1:
                     x = reshard(x, old_flattened[device_index].shape)
+                elif shards_out > shards_in:
+                    x = reshard_reverse(x, old_flattened[device_index].shape)
+                else:
+                    raise NotImplementedError(f"Unsupported shards_in and shards_out: {shards_in} and {shards_out}")
                 unsharded.append(x)
 
                 assert x.shape == old_flattened[device_index].shape, f"Incompatible checkpoints {x.shape} vs {old_flattened[device_index].shape}"
@@ -189,10 +296,6 @@ def read_ckpt(pytree, dir, shards_in, shards_out=None, load_opt=True):
     if not load_opt:
         loaded_pytree['opt_state'] = original_opt_state
     return loaded_pytree
-
-
-def read_ckpt_lowmem(*args, **kwargs):
-    return read_ckpt(*args, **kwargs)
 
 
 def parallel_write(arrays, fname):
@@ -280,8 +383,6 @@ def write_ckpt_v2(model_state, dir):
 
 
 def read_sharded_v2(state, dir, checkpoint_hosts, state_shard):
-    import ray
-
     files_per_host = checkpoint_hosts // jax.host_count()
 
     assert files_per_host >= 1, "can't restore model to larger pod than was trained on (yet)"

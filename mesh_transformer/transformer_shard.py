@@ -21,7 +21,19 @@ from mesh_transformer.layers import EmbeddingShard, TransformerLayerShard, Relat
     create_alibi_tensor, \
     TransformerLayerShardV2, Projection, EmbeddingShardV2
 from mesh_transformer.util import to_f32, to_bf16, maybe_shard, head_print, global_norm, f_psum
+from mesh_transformer.util import process_index, process_count
 from jax.experimental import PartitionSpec as P
+
+from smart_open import open
+import functools
+
+if not getattr(print, "_train_actor_patched", False):
+    old_print = print
+    @functools.wraps(print)
+    def new_print(*args, **kwargs):
+        old_print(f"[NODE {process_index()}]", *args, **kwargs)
+    new_print._train_actor_patched = True
+    print = new_print
 
 
 class PlaceholderTensor:
@@ -316,7 +328,7 @@ class CausalTransformer:
 
             grad_norm_micro = jax.lax.pmean(gnorm, "batch")
 
-            grad = jax.lax.pmean(grad, "batch")
+            grad = jax.lax.psum(grad, "batch")
             grad_norm = global_norm(grad)
             updates, new_opt_state = optimizer.update(grad, state["opt_state"], state["params"])
 
@@ -438,23 +450,39 @@ class CausalTransformer:
         param_count = hk.data_structures.tree_size(self.state['params'])
         head_print(f"Total parameters: {param_count}")
 
-    def write_ckpt(self, path, shard):
-        write_ckpt(self.state, path, shard)
+    def write_ckpt(self, path, shard, save_opt_state=True):
+        node_index = process_index()
+        if node_index >= thread_resources.env.shape['mp'] // 8:
+            print(f"Skipping saving for node {node_index} because {node_index} >= mp/8")
+            return
+        total_shards = self.config.get("shards", self.config["cores_per_replica"])
+        print(f"Node {node_index} is saving shard {shard + (node_index * jax.local_device_count())%total_shards} to {path}")
+        write_ckpt(self.state, path, shard, node_index, save_opt_state=save_opt_state, total_shards=total_shards)
 
-    def load_ckpt(self, path):
-        self.state = read_ckpt(self.state, path, thread_resources.env.shape['mp'])
+    def load_ckpt(self, path, finetuning=False):
+        node_index = process_index()
+        shard_offset = (node_index * jax.local_device_count()) % self.config.get("shards", self.config["cores_per_replica"])
+        print(f"Node {node_index} is allocated shards {shard_offset}-{shard_offset + jax.local_device_count() - 1}")
+        init_sched_state = self.state["opt_state"][-1]
+        self.state = read_ckpt(self.state, path, shards_in=min(jax.local_device_count(), self.config.get("shards", thread_resources.env.shape['mp'])), shards_out=min(jax.local_device_count(), thread_resources.env.shape['mp']), shard_offset=shard_offset)
+        if finetuning:
+            self.state["opt_state"][-1] = init_sched_state
 
-    def train(self, sample):
+    def train(self, sample, chunks=1):
         # print("train iter")
         # print("sample", sample["obs"])
         # print("target", sample["target"])
-        obs = jnp.transpose(sample["obs"], (1, 0, 2))
-        target = jnp.transpose(sample["target"], (1, 0, 2))
+
+        sample_obs = jnp.array_split(sample["obs"], chunks, axis=1)
+        sample_obs = sample_obs[process_index() // (process_count() // chunks)]
+        sample_target = jnp.array_split(sample["target"], chunks, axis=1)
+        sample_target = sample_target[process_index() // (process_count() // chunks)]
+
+        obs = jnp.transpose(sample_obs, (1, 0, 2))
+        target = jnp.transpose(sample_target, (1, 0, 2))
 
         # print("train sample", obs.shape)
         # print("train target", target.shape)
-
-        # assert (sample["obs"][:, 1:] == sample["target"][:, -1])
 
         # start = time.time()
         loss, last_loss, grad_norm, grad_norm_micro, self.state = self.train_xmap(self.state, obs, target)
@@ -835,7 +863,7 @@ class CausalTransformerV2:
         param_count = hk.data_structures.tree_size(self.state['params'])
         head_print(f"Total parameters: {param_count * dp}")
 
-    def write_ckpt(self, path, _):
+    def write_ckpt(self, path, _, save_opt_state=True):
         write_ckpt_v2(self.state, path)
 
     def load_ckpt(self, path):

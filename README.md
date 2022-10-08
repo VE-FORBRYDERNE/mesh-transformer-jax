@@ -1,11 +1,12 @@
 # Branch summary
-This branch contains all of the patches from the following branches:
-* __soft__ (can load soft prompts (but not train them); see that branch's README.md for more details)
-* __modelcompat__ (can load GPT-Neo, fairseq and GPT-NeoX models; see that branch's README.md for more details)
-* __lowmem-fastinstall__ (installs faster in Google Colab)
-* __main__
+This is a version of the *all* branch with modifications to allow it to train models on TPUv2 pods and TPUv3 pods. TPUv4 pods are not supported yet. This branch can train all model types that can be run in inference mode.
+
+This branch was used to train KoboldAI's [GPT-NeoX-20B-Erebus](https://huggingface.co/KoboldAI/GPT-NeoX-20B-Erebus) and [GPT-NeoX-20B-Skein](https://huggingface.co/KoboldAI/GPT-NeoX-20B-Skein) models. To train GPT-NeoX-20B models, you need a TPUv3 pod with at least 32 cores, or a TPUv2 pod with an equivalent amount of memory. See https://wandb.ai/ve-forbryderne/skein-20b/runs/7v58c5y8/overview for an example training command and configuration. Change `cores_per_replica` to the number of shards the model checkpoint has (the number of TPU cores in your pod should be divisible by this number). If your TPU pod has more than 32 cores, just change `tpu_size` to correspond; do not increase `per_replica_batch`.
 
 ## Patches in this branch:
+
+* __(/20b-conversion/*, /convert_neox_jax_to_hf.py, /create_finetune_tfrecords.20b.py)__ Added scripts to help with training GPT-NeoX models.
+* __(/ray_tpu.py, /tfrecord_loader.py, /train.py, /mesh_transformer/TPU_cluster.py, /mesh_transformer/build_model.py, /mesh_transformer/checkpoint.py, /mesh_transformer/TPU_cluster.py, /mesh_transformer/train_actor.py, /mesh_transformer/transformer_shard.py and /mesh_transformer/util.py)__ Modified these files to work properly when `cores_per_replica > 8` and added additional logging.
 
 Inherited from **soft**:
 

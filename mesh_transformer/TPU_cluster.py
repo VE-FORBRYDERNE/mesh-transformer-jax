@@ -1,6 +1,7 @@
 import itertools
 import json
 import time
+import math
 
 import ray
 
@@ -19,12 +20,15 @@ class TPUCluster:
                  mesh_shape,
                  node_count,
                  model: Callable,
+                 scheduler=None,
                  version=1):
         assert ray.is_initialized()  # needs a valid ray cluster to start
         self.nodes = []
         self.node_count = node_count
+        self.mesh_shape = mesh_shape
         self.dp, self.mp = mesh_shape
         self.version = version
+        self.scheduler = scheduler
 
         start = time.time()
 
@@ -41,29 +45,33 @@ class TPUCluster:
         self.param_count = ray.get(params)[0]
         print(f"Ray actors created in {time.time() - start:.06}s")
 
-    @func_set_timeout(600)
+    @func_set_timeout(3000)
     def train(self, data):
-        data_chunks = np.array_split(data, len(self.nodes), axis=1)
+        assert len(self.nodes) % self.dp == 0
 
         res = []
-        for n, d in zip(self.nodes, data_chunks):
+        for i, n in enumerate(self.nodes):
             res.append(n.train.remote({
-                "obs": d[:, :, :-1],
-                "target": d[:, :, 1:],
-            }))
+                "obs": data[:, :, :-1],
+                "target": data[:, :, 1:],
+            }, self.dp))
 
         res = ray.get(res)
 
         loss = []
         last_loss = []
+        grad_norm = []
+        grad_norm_micro = []
 
         for r in res:
             loss.append(r[0])
             last_loss.append(r[1])
+            grad_norm.append(r[2])
+            grad_norm_micro.append(r[3])
 
-        return np.array(loss).mean(), np.array(last_loss).mean()
+        return np.array(loss).mean(), np.array(last_loss).mean(), np.array(grad_norm).mean(), np.array(grad_norm_micro).mean()
 
-    @func_set_timeout(600)
+    @func_set_timeout(3000)
     def eval(self, data):
         if isinstance(data, dict):
             data_chunked = [{} for _ in self.nodes]
@@ -124,8 +132,8 @@ class TPUCluster:
 
             return np.array([i["loss"] for i in ray.get(res)]).mean()
 
-    @func_set_timeout(600)
-    def generate(self, context, ctx_length, gen_len):
+    @func_set_timeout(3000)
+    def generate(self, context, ctx_length, gen_len, sampler_options):
         context = np.array_split(context, len(self.nodes), axis=0)
         ctx_length = np.array_split(ctx_length, len(self.nodes), axis=0)
 
@@ -134,12 +142,13 @@ class TPUCluster:
             res.append(n.generate.remote((
                 ctx,
                 np.ones(len(ctx), dtype=np.uint32) * l,
-                gen_len
+                gen_len,
+                sampler_options
             )))
 
         return np.concatenate([i[1][0][:, :, 0] for i in ray.get(res)], axis=0)
 
-    @func_set_timeout(600)
+    @func_set_timeout(3000)
     def move(self):
         start = time.time()
         res = []
@@ -149,8 +158,8 @@ class TPUCluster:
 
         print(f"Moved weights to TPU in {time.time() - start:.06}s")
 
-    @func_set_timeout(1800)
-    def load(self, bucket, path):
+    @func_set_timeout(5000)
+    def load(self, bucket, path, finetuning=True):
         with open(f"gs://{bucket}/{path}/meta.json", "r") as f:
             meta = json.load(f)
 
@@ -160,18 +169,20 @@ class TPUCluster:
         start = time.time()
         res = []
         for node in self.nodes:
-            res.append(node.load_ckpt.remote(f"gs://{bucket}/{path}/step_{ckpt_step}/"))
+            res.append(node.load_ckpt.remote(f"gs://{bucket}/{path}/step_{ckpt_step}/", finetuning))
 
         # make sure they all read from the same checkpoint
-        step = np.array(ray.get(res))
+        step, opt_step = map(np.array, zip(*ray.get(res)))
         assert (step[0] == step).all()
+        assert (opt_step[0] == opt_step).all()
         step = int(step[0])
+        opt_step = int(opt_step[0])
 
         print(f"Checkpoint@step{step} restored in {time.time() - start:.06}s")
-        return step, meta["aux"][str(ckpt_step)]
+        return step, meta["aux"][str(ckpt_step)], opt_step
 
-    @func_set_timeout(600)
-    def save(self, step, bucket, path, aux=None, init=False, overwrite=False, keep_n=3, delete_old=True):
+    @func_set_timeout(3000)
+    def save(self, step, bucket, path, aux=None, init=False, overwrite=False, keep_n=3, delete_old=True, save_opt_state=True):
         assert path
         client = storage.Client()
 
@@ -199,11 +210,13 @@ class TPUCluster:
         res = []
 
         if self.version == 1:
-            for shard_id, node in zip(range(self.mp), itertools.cycle(self.nodes)):
-                res.append(node.write_ckpt.remote(f"gs://{bucket}/{path}/step_{step}/", shard_id))
+            for shard_id in range(self.mp * self.dp):
+                node_index = shard_id // 8
+                node = self.nodes[node_index]
+                res.append(node.write_ckpt.remote(f"gs://{bucket}/{path}/step_{step}/", (shard_id % self.mp) % 8, save_opt_state))
         elif self.version == 2:
             for node in self.nodes:
-                res.append(node.write_ckpt.remote(f"gs://{bucket}/{path}/step_{step}", 0))
+                res.append(node.write_ckpt.remote(f"gs://{bucket}/{path}/step_{step}", 0, save_opt_state))
 
         ray.get(res)
         print(f"Wrote checkpoint in {time.time() - start:.06}s")
