@@ -37,6 +37,19 @@ def gpt3_schedule(warmup_steps,
     return sch
 
 
+def linear_schedule(warmup_steps,
+                    total_steps,
+                    peak_lr,
+                    end_lr):
+    def sch(step):
+        warmup_pct = jnp.clip(step, 0, warmup_steps) / warmup_steps
+        anneal_pct = jnp.clip(step - warmup_steps, 0, total_steps) / total_steps
+
+        return warmup_pct * peak_lr - (peak_lr - end_lr) * anneal_pct
+
+    return sch
+
+
 def global_norm(updates, use_psum=True):
     pre_sqrt = sum([jnp.sum(jnp.square(x)) for x in jax.tree_leaves(updates)])
     if use_psum:

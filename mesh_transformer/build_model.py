@@ -54,7 +54,7 @@ def build_model(params, tpu_name, region, preemptible, version=1):
     with multiprocessing.pool.ThreadPool(processes=len(conns)) as p:
         p.map(functools.partial(start_ray, address=address, version=version), conns)
     
-    scheduler = util.gpt3_schedule(warmup_steps, anneal_steps, lr, end_lr)
+    scheduler = (util.linear_schedule if params.get("schedule", "cosine") == "linear" else util.gpt3_schedule)(warmup_steps, anneal_steps, lr, end_lr)
 
     opt = optax.chain(
         optax.scale(1 / gradient_accumulation_steps),
